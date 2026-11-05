@@ -70,7 +70,7 @@ Blender is not affected by any of this.
 | `CreateMeshBuilder`, `[MeshBuilder]` | |
 | `Vertex`/`AddVertex`, `Face`/`Face2`/`AddFace`/`AddFace2` | Quads and polygons are triangulated |
 | `Cube`, `Cylinder` | |
-| `Translate`, `Scale`, `Rotate`, `Shear`, `Mirror` | Plus the `*All` variants |
+| `Translate`, `Scale`, `Rotate`, `Shear`, `Mirror` | Plus the `*All` variants. `Rotate` with a zero axis turns about X, like openBVE |
 | `Color`, `EmissiveColor`, `BlendMode` | |
 | `Load`/`LoadTexture`, `Transparent`/`SetDecalTransparentColor` | Day texture is used |
 | `Coordinates`/`SetTextureCoordinates` | |

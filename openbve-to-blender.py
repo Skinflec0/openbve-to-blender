@@ -13,11 +13,9 @@ Position (first state, animation functions ignored), producing one GLB per car.
 Text DirectX .x objects (Mesh/Material/TextureFilename/Frame) are read too.
 Not supported (skipped with a warning): binary/compressed .x objects, animation functions.
 
-Roblox: Studio's importer ignores the texture's alpha channel, so cut-outs (windows, doors)
-turn solid. Cut-out pixels are therefore filled with the surrounding colour (never the BVE key
-colour), and a helper roblox_fix_transparency.lua is written next to the output; run it in the
-Studio command bar after importing. Triangles that are 100% cut out (typical window panes) are
-also removed, so they become real holes even if Roblox drops the alpha channel.
+Roblox: importing the GLB still has transparency problems (see README). Cut-out pixels are filled
+with the surrounding colour (never the BVE key colour) and triangles that are 100% cut out are
+removed, but partly transparent parts may still look wrong in Studio.
 
 Usage:
   Double-click            -> pick one or more .b3d/.csv files (cancel to pick a folder)
@@ -54,6 +52,8 @@ LOOSE_DIR = "loose_parts"
 FORCE_DOUBLE_SIDED = False
 KEY_TOLERANCE = None          # None = automatic (see transparent_tolerance)
 CUT_CLEAR_FACES = True        # drop triangles whose texture area is 100% cut out (windows etc.)
+CUT_PART = None               # None | "opaque" | "cutout" (used by --split-cutouts)
+SPLIT_CUTOUTS = False
 _ALPHA_CACHE = {}             # (path, transp, additive) -> alpha channel (PIL 'L' image)
 
 
@@ -151,7 +151,9 @@ def read_text(path):
 def rotate_fn(ax, ay, az, deg):
     length = math.sqrt(ax * ax + ay * ay + az * az)
     if length == 0:
-        return None
+        # openBVE: a zero direction vector means "rotate about the X axis". Real trains rely on it,
+        # e.g. `Rotate 0,0,0,90` to turn a Y-axis Cylinder into a headlight pointing forward.
+        ax, ay, az, length = 1.0, 0.0, 0.0, 1.0
     kx, ky, kz = ax / length, ay / length, az / length
     c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
 
@@ -790,7 +792,7 @@ class Glb:
         else:
             label = "color_%02x%02x%02x" % tuple(color[:3])
         if tex is not None and mode in ("MASK", "BLEND"):
-            label += "_cutout"                      # lets roblox_fix_transparency.lua find them
+            label += "_cutout"                      # marks materials with cut-outs
         m = {"name": "%s_%d" % (label, len(self.materials)), "pbrMetallicRoughness": pbr,
              "doubleSided": bool(double) or FORCE_DOUBLE_SIDED}
         if any(emissive):
@@ -882,6 +884,10 @@ class Glb:
         for mat, (pos, nor, uv, ind, _) in groups.items():
             if not ind:
                 continue
+            if CUT_PART:
+                is_cut = self.materials[mat].get("alphaMode") in ("MASK", "BLEND")
+                if (CUT_PART == "opaque" and is_cut) or (CUT_PART == "cutout" and not is_cut):
+                    continue
             tris += len(ind) // 3
             prims.append({"attributes": {"POSITION": self._acc(pos, 3, "VEC3", True),
                                          "NORMAL": self._acc(nor, 3, "VEC3"),
@@ -1150,58 +1156,6 @@ def build_animated(path, flip, warn):
     return g, total[0]
 
 
-ROBLOX_LUA = """-- Run in Roblox Studio's Command Bar after importing the GLB.
--- Select the imported model first (or select nothing to process the whole workspace).
---
--- Studio's importer drops the texture alpha, and Roblox only blends alpha when
--- AlphaMode = Transparency AND MeshPart.Transparency > 0. Transparency makes Roblox sort the
--- part against other transparent parts, so overlapping ones flicker or vanish. To keep that
--- to a minimum this only touches parts that really have cut-outs:
---   * parts/materials whose name contains "cutout" (the converter adds that tag), or
---   * if nothing is tagged: every MeshPart that is SELECTED and has a SurfaceAppearance.
-local TRANSPARENCY = 0.02   -- raise towards 0.09 only if cut-outs still show solid
-
-local Selection = game:GetService("Selection")
-local selected = Selection:Get()
-local roots = #selected > 0 and selected or { workspace }
-
-local function isPart(d) return d:IsA("MeshPart") and d:FindFirstChildOfClass("SurfaceAppearance") ~= nil end
-local function tagged(d)
-	local sa = d:FindFirstChildOfClass("SurfaceAppearance")
-	return string.find(string.lower(d.Name), "cutout") ~= nil
-		or (sa ~= nil and string.find(string.lower(sa.Name), "cutout") ~= nil)
-end
-
-local parts, anyTagged = {}, false
-for _, root in ipairs(roots) do
-	local list = root:GetDescendants()
-	table.insert(list, root)
-	for _, d in ipairs(list) do
-		if isPart(d) then
-			table.insert(parts, d)
-			if tagged(d) then anyTagged = true end
-		end
-	end
-end
-
-local count = 0
-for _, d in ipairs(parts) do
-	local use = anyTagged and tagged(d) or (not anyTagged and #selected > 0)
-	if use then
-		d:FindFirstChildOfClass("SurfaceAppearance").AlphaMode = Enum.AlphaMode.Transparency
-		d.Transparency = TRANSPARENCY
-		count += 1
-	end
-end
-if count == 0 then
-	warn("No cut-out parts found. Select just the window/strap parts and run again.")
-else
-	print("Cut-out transparency applied to " .. count .. " MeshPart(s)" ..
-		(anyTagged and " (tagged parts only)" or " (selected parts)"))
-end
-"""
-
-
 # --------------------------------------------------------------- driver
 def collect(paths):
     items, skipped = [], []
@@ -1293,16 +1247,32 @@ def convert(items, outdir, combine, flip, flat=False):
         msgs = []
         warn = msgs.append
         try:
-            if f.suffix.lower() in ANIM_EXTS:
-                g, tris = build_animated(f, flip, warn)
-                if combine and glb is not None and tris > 0:
-                    glb.merge(g)
-            else:
-                builders = load_builders(f, warn)
-                g = Glb()
-                tris = g.add_object(f.stem, builders, f.parent, flip, warn)
-                if combine and glb is not None and tris > 0:
-                    glb.merge(g)
+            def build_one(part):
+                global CUT_PART
+                CUT_PART = part
+                try:
+                    if f.suffix.lower() in ANIM_EXTS:
+                        return build_animated(f, flip, warn)
+                    gg = Glb()
+                    return gg, gg.add_object(f.stem, load_builders(f, warn), f.parent, flip, warn)
+                finally:
+                    CUT_PART = None
+
+            g, tris = build_one("opaque" if SPLIT_CUTOUTS else None)
+            if combine and glb is not None and tris > 0:
+                glb.merge(g)
+            if SPLIT_CUTOUTS:
+                g2, tris2 = build_one("cutout")
+                if tris2 > 0:
+                    d2 = out_dir(f, root)
+                    d2.mkdir(parents=True, exist_ok=True)
+                    out2 = d2 / (names[(f, root)] + "_cutouts.glb")
+                    g2.write(out2)
+                    if verify_glb(out2):
+                        made.append(out2)
+                        print("%s %s: %d cut-out triangles -> %s" % (tag(n, total), label, tris2, out2.name))
+                    else:
+                        failed.append(label + " (cut-out file failed verification)")
 
             if tris == 0:
                 no_geo.append(label)
@@ -1385,9 +1355,13 @@ def main():
     ap.add_argument("--keep-cutouts", action="store_true",
                     help="keep triangles that are 100%% transparent (default: remove them; they are "
                          "invisible anyway, and Roblox shows them as solid because it ignores alpha)")
+    ap.add_argument("--split-cutouts", action="store_true",
+                    help="write partly transparent parts (grilles, straps, glass) to a separate "
+                         "<name>_cutouts.glb, so they can be handled separately (e.g. in Roblox)")
     ap.add_argument("--single-sided", action="store_true", help=argparse.SUPPRESS)  # old option, now the default
     a = ap.parse_args()
-    global FORCE_DOUBLE_SIDED, KEY_TOLERANCE, CUT_CLEAR_FACES
+    global FORCE_DOUBLE_SIDED, KEY_TOLERANCE, CUT_CLEAR_FACES, SPLIT_CUTOUTS
+    SPLIT_CUTOUTS = a.split_cutouts
     KEY_TOLERANCE = a.key_tolerance
     CUT_CLEAR_FACES = not a.keep_cutouts
     FORCE_DOUBLE_SIDED = a.double_sided and not a.single_sided
@@ -1424,12 +1398,6 @@ def main():
         outroot = (Path(a.outdir) if a.outdir
                    else (default_outdir(p0) if p0.is_dir() else made[0].parent))
         print("Output folder:", outroot)
-        try:
-            lua_path = Path(outroot) / "roblox_fix_transparency.lua"
-            lua_path.write_text(ROBLOX_LUA, encoding="utf-8")
-            print("Roblox helper:", lua_path, "(see README: run it after importing to fix solid windows)")
-        except OSError:
-            pass
         n_asm = sum(1 for m in made if ASSEMBLED_DIR in m.parts)
         n_loose = sum(1 for m in made if LOOSE_DIR in m.parts)
         if n_asm:
