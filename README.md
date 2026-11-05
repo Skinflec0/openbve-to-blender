@@ -31,6 +31,7 @@ python openbve-to-blender.py "C:\Trains\MyTrain" --match "9525*"
 | `--parts` | Also write every loose `.b3d`/`.csv`/`.x` part, not only assembled cars |
 | `--no-loose` | Skip parts that no `.animated` file uses |
 | `--match PATTERN` | Only convert `.animated` files matching a pattern, e.g. `"9525*"` |
+| `--keep-cutouts` | Keep triangles that are 100% transparent (default: they are removed) |
 | `--double-sided` | Make every face visible from both sides (BVE default: only `Face2`/`AddFace2`) |
 | `--key-tolerance N` | How far (0-255) a pixel may differ from the transparent colour and still be cut out. Try `0` if dark parts vanish, `60`-`100` if window cut-outs stay solid |
 
@@ -51,10 +52,13 @@ BVE is left-handed (+Z forward). The GLB is right-handed with Z mirrored, so in 
 
 ## Importing into Roblox Studio
 
-Roblox's importer ignores the alpha channel of textures, so BVE cut-outs would normally come in as solid blue (or whatever the key colour was). Two things handle it:
+Roblox's importer does not reliably keep the alpha channel of textures, so BVE cut-outs would normally come in as solid blue (or whatever the key colour was). Three things handle it:
 
-1. **The converter already fills cut-out pixels with the surrounding colour**, never the key colour, so windows are no longer blue even when alpha is ignored.
-2. **To make them see-through**, import the GLB, select the imported model, open **View > Command Bar**, paste the contents of `roblox_fix_transparency.lua` and press Enter. It sets `SurfaceAppearance.AlphaMode` to `Transparency` on every material. Select nothing to process the whole workspace.
+1. **Cut-out pixels are filled with the surrounding colour**, never the key colour, so nothing comes in blue.
+2. **Triangles that are 100% cut out (typical window panes) are removed**, so they become real holes whether or not Roblox keeps the alpha. Partly transparent parts such as handstraps and grilles are kept. Use `--keep-cutouts` to turn this off.
+3. **For partly transparent parts** (handstraps, grilles, glass with detail): import the GLB, select the model, open **View > Command Bar**, paste `roblox_fix_transparency.lua` and press Enter. Roblox only blends alpha when `SurfaceAppearance.AlphaMode` is `Transparency` **and** `MeshPart.Transparency` is above 0, so the script sets both (`0.02` by default). It only touches parts whose name contains `cutout` (the converter tags those materials). If your import doesn't keep material names, select just the window/strap parts and run it; it then applies to the selection only.
+
+**Overlapping transparent parts flicker or disappear** because Roblox sorts transparent parts against each other. Keep transparency on as few parts as possible (never on the car shell), and keep the value low (`0.02`; raise toward `0.09` only if cut-outs still look solid).
 
 If a part is still odd, select it and check that `SurfaceAppearance.AlphaMode` is `Transparency` and `MeshPart.Transparency` is `0`. Roblox recommends about `0.02` for soft, semi-transparent glass.
 
@@ -90,7 +94,7 @@ Roblox has its own limits on mesh size, so very detailed cars may need splitting
 | Windows are solid in Blender | Raise `--key-tolerance` (JPEG textures), e.g. `80` |
 | Dark parts disappeared | Run with `--key-tolerance 0` |
 | Textures are grey or missing | Check the console for `texture not found` and keep the texture files inside the train folder |
-| Windows are blue or solid in Roblox | See [Importing into Roblox Studio](#importing-into-roblox-studio) |
+| Windows are blue or solid in Roblox | Re-run the converter (latest version), re-import, then see [Importing into Roblox Studio](#importing-into-roblox-studio) |
 | `no [Object]/[Include] entries found` | The `.animated` file uses an unusual layout; use `--parts` to export the parts instead |
 
 ## License

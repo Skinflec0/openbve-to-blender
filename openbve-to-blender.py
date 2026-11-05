@@ -16,7 +16,8 @@ Not supported (skipped with a warning): binary/compressed .x objects, animation 
 Roblox: Studio's importer ignores the texture's alpha channel, so cut-outs (windows, doors)
 turn solid. Cut-out pixels are therefore filled with the surrounding colour (never the BVE key
 colour), and a helper roblox_fix_transparency.lua is written next to the output; run it in the
-Studio command bar after importing.
+Studio command bar after importing. Triangles that are 100% cut out (typical window panes) are
+also removed, so they become real holes even if Roblox drops the alpha channel.
 
 Usage:
   Double-click            -> pick one or more .b3d/.csv files (cancel to pick a folder)
@@ -52,6 +53,8 @@ ASSEMBLED_DIR = "assembled_models"
 LOOSE_DIR = "loose_parts"
 FORCE_DOUBLE_SIDED = False
 KEY_TOLERANCE = None          # None = automatic (see transparent_tolerance)
+CUT_CLEAR_FACES = True        # drop triangles whose texture area is 100% cut out (windows etc.)
+_ALPHA_CACHE = {}             # (path, transp, additive) -> alpha channel (PIL 'L' image)
 
 
 # --------------------------------------------------------------- Pillow
@@ -680,6 +683,8 @@ def process_texture(path, transp, additive, warn):
                     a_ = ImageChops.darker(a_, lum)
                     img.putalpha(a_)
                 lo = a_.getextrema()[0]
+                if lo == 0 and transp is not None and not additive:
+                    _ALPHA_CACHE[key] = a_
                 mode = "OPAQUE"
                 if lo < 255:
                     mode = "MASK" if (transp is not None and not additive) else "BLEND"
@@ -698,6 +703,25 @@ def process_texture(path, transp, additive, warn):
         warn("texture %s failed: %s" % (Path(path).name, e))
     _TEX_CACHE[key] = result
     return result
+
+
+def tri_is_clear(alpha, uvs):
+    """True if the whole UV bounding box of a triangle lies on fully cut-out pixels
+    (conservative: any opaque pixel inside the box, or a box spanning more than one tile, keeps it)."""
+    us = [u for u, _ in uvs]
+    vs = [v for _, v in uvs]
+    if max(us) - min(us) > 1.0 + 1e-6 or max(vs) - min(vs) > 1.0 + 1e-6:
+        return False
+    w, h = alpha.size
+    u0, u1 = min(us) % 1.0, min(us) % 1.0 + (max(us) - min(us))
+    v0, v1 = min(vs) % 1.0, min(vs) % 1.0 + (max(vs) - min(vs))
+    if u1 > 1.0 + 1e-6 or v1 > 1.0 + 1e-6:        # box wraps around the texture edge
+        return False
+    box = (max(0, int(u0 * w) - 1), max(0, int(v0 * h) - 1),
+           min(w, int(math.ceil(u1 * w)) + 2), min(h, int(math.ceil(v1 * h)) + 2))
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return False
+    return alpha.crop(box).getextrema()[1] == 0
 
 
 class Glb:
@@ -765,6 +789,8 @@ class Glb:
             label = self.images[self.textures[tex]["source"]].get("name", "tex")
         else:
             label = "color_%02x%02x%02x" % tuple(color[:3])
+        if tex is not None and mode in ("MASK", "BLEND"):
+            label += "_cutout"                      # lets roblox_fix_transparency.lua find them
         m = {"name": "%s_%d" % (label, len(self.materials)), "pbrMetallicRoughness": pbr,
              "doubleSided": bool(double) or FORCE_DOUBLE_SIDED}
         if any(emissive):
@@ -788,9 +814,11 @@ class Glb:
     def build_mesh(self, name, builders, base_dir, flip, warn):
         groups = {}
         bad = 0
+        cut = 0
         for b in builders:
             tex = None
             mode = "OPAQUE"
+            alpha = None
             if b.tex:
                 p = find_texture(b.tex, base_dir)
                 if p is None:
@@ -799,6 +827,8 @@ class Glb:
                     t = self.texture(p, b.transp, b.additive, warn)
                     if t:
                         tex, mode = t
+                        if CUT_CLEAR_FACES and mode == "MASK":
+                            alpha = _ALPHA_CACHE.get((str(p), b.transp, b.additive))
             if b.color[3] < 255 and mode == "OPAQUE":
                 mode = "BLEND"
             n = len(b.verts)
@@ -817,6 +847,9 @@ class Glb:
                     tri = [good[0], good[k + 1], good[k]]
                     if flip:
                         tri = [tri[0], tri[2], tri[1]]
+                    if alpha is not None and tri_is_clear(alpha, [b.uv.get(i, (0.0, 0.0)) for i in tri]):
+                        cut += 1
+                        continue
                     pts = [(b.verts[i][0], b.verts[i][1], -b.verts[i][2]) for i in tri]
                     e1 = [pts[1][j] - pts[0][j] for j in range(3)]
                     e2 = [pts[2][j] - pts[0][j] for j in range(3)]
@@ -841,6 +874,9 @@ class Glb:
                         ind.append(vi)
         if bad:
             warn("%d face(s) referenced missing vertices" % bad)
+        if cut:
+            warn("removed %d fully transparent triangle(s) (window/door cut-outs become real holes; "
+                 "use --keep-cutouts to keep them)" % cut)
         prims = []
         tris = 0
         for mat, (pos, nor, uv, ind, _) in groups.items():
@@ -1116,23 +1152,53 @@ def build_animated(path, flip, warn):
 
 ROBLOX_LUA = """-- Run in Roblox Studio's Command Bar after importing the GLB.
 -- Select the imported model first (or select nothing to process the whole workspace).
--- Studio's importer ignores the texture alpha channel; this switches it on so windows,
--- doors and other cut-outs become see-through instead of solid.
+--
+-- Studio's importer drops the texture alpha, and Roblox only blends alpha when
+-- AlphaMode = Transparency AND MeshPart.Transparency > 0. Transparency makes Roblox sort the
+-- part against other transparent parts, so overlapping ones flicker or vanish. To keep that
+-- to a minimum this only touches parts that really have cut-outs:
+--   * parts/materials whose name contains "cutout" (the converter adds that tag), or
+--   * if nothing is tagged: every MeshPart that is SELECTED and has a SurfaceAppearance.
+local TRANSPARENCY = 0.02   -- raise towards 0.09 only if cut-outs still show solid
+
 local Selection = game:GetService("Selection")
-local roots = Selection:Get()
-if #roots == 0 then roots = { workspace } end
-local count = 0
+local selected = Selection:Get()
+local roots = #selected > 0 and selected or { workspace }
+
+local function isPart(d) return d:IsA("MeshPart") and d:FindFirstChildOfClass("SurfaceAppearance") ~= nil end
+local function tagged(d)
+	local sa = d:FindFirstChildOfClass("SurfaceAppearance")
+	return string.find(string.lower(d.Name), "cutout") ~= nil
+		or (sa ~= nil and string.find(string.lower(sa.Name), "cutout") ~= nil)
+end
+
+local parts, anyTagged = {}, false
 for _, root in ipairs(roots) do
 	local list = root:GetDescendants()
 	table.insert(list, root)
 	for _, d in ipairs(list) do
-		if d:IsA("SurfaceAppearance") then
-			d.AlphaMode = Enum.AlphaMode.Transparency
-			count += 1
+		if isPart(d) then
+			table.insert(parts, d)
+			if tagged(d) then anyTagged = true end
 		end
 	end
 end
-print("AlphaMode set to Transparency on " .. count .. " SurfaceAppearance object(s)")
+
+local count = 0
+for _, d in ipairs(parts) do
+	local use = anyTagged and tagged(d) or (not anyTagged and #selected > 0)
+	if use then
+		d:FindFirstChildOfClass("SurfaceAppearance").AlphaMode = Enum.AlphaMode.Transparency
+		d.Transparency = TRANSPARENCY
+		count += 1
+	end
+end
+if count == 0 then
+	warn("No cut-out parts found. Select just the window/strap parts and run again.")
+else
+	print("Cut-out transparency applied to " .. count .. " MeshPart(s)" ..
+		(anyTagged and " (tagged parts only)" or " (selected parts)"))
+end
 """
 
 
@@ -1316,10 +1382,14 @@ def main():
                     help="how far (0-255) a pixel may differ from the transparent colour and still be "
                          "cut out. Default: automatic (exact for lossless files). Try 0 if dark "
                          "parts vanish, or 60-100 if window cut-outs stay solid.")
+    ap.add_argument("--keep-cutouts", action="store_true",
+                    help="keep triangles that are 100%% transparent (default: remove them; they are "
+                         "invisible anyway, and Roblox shows them as solid because it ignores alpha)")
     ap.add_argument("--single-sided", action="store_true", help=argparse.SUPPRESS)  # old option, now the default
     a = ap.parse_args()
-    global FORCE_DOUBLE_SIDED, KEY_TOLERANCE
+    global FORCE_DOUBLE_SIDED, KEY_TOLERANCE, CUT_CLEAR_FACES
     KEY_TOLERANCE = a.key_tolerance
+    CUT_CLEAR_FACES = not a.keep_cutouts
     FORCE_DOUBLE_SIDED = a.double_sided and not a.single_sided
     paths = a.paths or pick_paths()
     if not paths:
