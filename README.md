@@ -77,6 +77,7 @@ Blender is not affected by any of this.
 | `.animated` | Every `[Object]`/`[Include]` placed at its first state and `Position` |
 | `.x` (text) | `Mesh`, `MeshMaterialList`, `Material`, `TextureFilename`, `MeshTextureCoords`, `Frame` transforms |
 | Texture lookup | Next to the object, then parent folders; falls back to another image extension (`roof.bmp` -> `roof.png`) |
+| Typos in numbers | Like openBVE, malformed values such as `1.85.4` use their leading valid part (`1.85`) |
 | Encodings | UTF-8, UTF-16/32, Windows-1252, Shift-JIS |
 
 ## Not supported

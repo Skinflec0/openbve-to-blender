@@ -105,11 +105,25 @@ CMD_RE = re.compile(r'^\s*(\[[^\]]*\]|[A-Za-z0-9_]+)(?:[\s,]+(.*))?$')
 SEC_RE = re.compile(r'^\[\s*([^\]]*?)\s*\]$')
 
 
+_NUM_PREFIX = re.compile(r"\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
+
+
+def lenient_float(text):
+    """Like openBVE (VB6 Val): malformed numbers such as `1.85.4` or `0.5m` use their leading
+    valid part (1.85 / 0.5). Returns None if there is none."""
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        m = _NUM_PREFIX.match(text or "")
+        return float(m.group(1)) if m else None
+
+
 def num(args, i, d=0.0):
     try:
-        return float(args[i])
-    except (IndexError, ValueError):
+        v = lenient_float(args[i])
+    except IndexError:
         return d
+    return d if v is None else v
 
 
 def parse_rgb(args, n=3, default=255):
@@ -241,10 +255,9 @@ def parse_bve(text, warn):
         elif cmd in ("face", "addface", "face2", "addface2"):
             idx = []
             for a in args:
-                try:
-                    idx.append(int(float(a)))
-                except ValueError:
-                    pass
+                v = lenient_float(a)
+                if v is not None:
+                    idx.append(int(v))
             cur.faces.append((idx, cmd.endswith("2")))
         elif cmd == "cube":
             # openBVE: Cube HalfWidth, HalfHeight, HalfDepth (the args ARE half-extents)
