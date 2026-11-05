@@ -11,7 +11,7 @@ EmissiveColor, textures (Load/LoadTexture), transparent colour
 Also assembles .animated files (3567.animated etc.): every [Object]/[Include] is placed at its
 Position (first state, animation functions ignored), producing one GLB per car.
 Text DirectX .x objects (Mesh/Material/TextureFilename/Frame) are read too.
-Not supported (skipped with a warning): binary/compressed .x objects, animation functions.
+Binary and MSZIP-compressed .x are read too. Not supported: animation functions.
 
 Roblox: importing the GLB still has transparency problems (see README). Cut-out pixels are filled
 with the surrounding colour (never the BVE key colour) and triangles that are 100% cut out are
@@ -21,6 +21,7 @@ Usage:
   Double-click            -> pick one or more .b3d/.csv files (cancel to pick a folder)
   python openbve-to-blender.py file.b3d [more files or folders ...]
   Options: -o OUTDIR   --combine (one GLB for everything)   --flip (reverse face winding)
+           --smooth-angle DEG (default 45; 0 = flat shading)
 
 Textures (PNG/JPG/BMP/...) are looked up next to each object, then in parent folders,
 and embedded in the GLB. If the exact file is missing, the same name with another image
@@ -54,6 +55,7 @@ KEY_TOLERANCE = None          # None = automatic (see transparent_tolerance)
 CUT_CLEAR_FACES = True        # drop triangles whose texture area is 100% cut out (windows etc.)
 CUT_PART = None               # None | "opaque" | "cutout" (used by --split-cutouts)
 SPLIT_CUTOUTS = False
+SMOOTH_ANGLE = 45.0           # degrees; faces meeting at a gentler angle share smooth normals (0 = flat)
 _ALPHA_CACHE = {}             # (path, transp, additive) -> alpha channel (PIL 'L' image)
 
 
@@ -183,6 +185,12 @@ def rotate_fn(ax, ay, az, deg):
 
 def shear_fn(dx, dy, dz, sx, sy, sz, r):
     """openBVE Shear: every vertex moves by  s * r * dot(d, v)."""
+    def unit(x, y, z):
+        t = math.sqrt(x * x + y * y + z * z)
+        return (x / t, y / t, z / t) if t else (x, y, z)
+    dx, dy, dz = unit(dx, dy, dz)          # openBVE normalises both vectors first
+    sx, sy, sz = unit(sx, sy, sz)
+
     def fn(v):
         n = r * (dx * v[0] + dy * v[1] + dz * v[2])
         return (v[0] + sx * n, v[1] + sy * n, v[2] + sz * n)
@@ -273,7 +281,8 @@ def parse_bve(text, warn):
             apply(builders if cmd.endswith("all") else [cur],
                   lambda v: (v[0] + dx, v[1] + dy, v[2] + dz))
         elif cmd in ("scale", "scaleall"):
-            sx, sy, sz = num(args, 0, 1.0), num(args, 1, 1.0), num(args, 2, 1.0)
+            # openBVE: a zero scale factor is an error and is replaced by 1
+            sx, sy, sz = (num(args, 0, 1.0) or 1.0, num(args, 1, 1.0) or 1.0, num(args, 2, 1.0) or 1.0)
             targets = builders if cmd.endswith("all") else [cur]
             apply(targets, lambda v: (v[0] * sx, v[1] * sy, v[2] * sz))
             if ((sx < 0) + (sy < 0) + (sz < 0)) % 2 == 1:
@@ -397,17 +406,89 @@ def _x_material(items):
     return color, tex
 
 
-def parse_x(text, warn):
+def _x_mszip(data):
+    """Decompress the MSZIP payload of 'bzip'/'tzip' .x files (chunks of <=32 KB, each chunk
+    uses the previous chunk as its dictionary)."""
+    import zlib
+    pos, out, prev = 20, bytearray(), b""
+    while pos + 4 <= len(data):
+        _, dsz = struct.unpack("<HH", data[pos:pos + 4])
+        pos += 4
+        chunk = data[pos:pos + dsz]
+        pos += dsz
+        if chunk[:2] != b"CK":
+            raise ValueError("bad MSZIP chunk")
+        d = zlib.decompressobj(-15, zdict=prev) if prev else zlib.decompressobj(-15)
+        prev = d.decompress(chunk[2:])
+        out += prev
+    return bytes(out)
+
+
+def _x_binary_tokens(data, floatsize):
+    """Binary .x payload (after the 16-byte header) -> the same token list the text reader makes."""
+    toks, pos, n = [], 0, len(data)
+    ff, fs = ("<d", 8) if floatsize == 64 else ("<f", 4)
+    depth_skip = 0                                    # brace depth while inside a `template { ... }`
+    in_tmpl = False                                   # saw TEMPLATE, waiting for its `{`
+    while pos + 2 <= n:
+        t = struct.unpack_from("<H", data, pos)[0]
+        pos += 2
+        if t in (1, 2):                               # NAME / STRING
+            ln = struct.unpack_from("<I", data, pos)[0]
+            s = data[pos + 4:pos + 4 + ln].decode("latin-1")
+            pos += 4 + ln
+            if t == 2:
+                pos += 2                              # terminator token (, or ;)
+            if not depth_skip and not in_tmpl:
+                toks.append('"%s"' % s if t == 2 else s)
+        elif t == 3:
+            pos += 4
+            if not depth_skip:
+                toks.append(str(struct.unpack_from("<I", data, pos - 4)[0]))
+        elif t == 5:
+            pos += 16
+        elif t == 6:
+            cnt = struct.unpack_from("<I", data, pos)[0]
+            vals = struct.unpack_from("<%dI" % cnt, data, pos + 4)
+            pos += 4 + 4 * cnt
+            if not depth_skip:
+                toks.extend(str(v) for v in vals)
+        elif t == 7:
+            cnt = struct.unpack_from("<I", data, pos)[0]
+            vals = struct.unpack_from("<%s" % (ff[1] * cnt), data, pos + 4)
+            pos += 4 + fs * cnt
+            if not depth_skip:
+                toks.extend(repr(v) for v in vals)
+        elif t == 10:
+            if in_tmpl:
+                in_tmpl, depth_skip = False, 1
+            elif depth_skip:
+                depth_skip += 1
+            else:
+                toks.append("{")
+        elif t == 11:
+            if depth_skip:
+                depth_skip -= 1
+            else:
+                toks.append("}")
+        elif t == 31:                                 # template definition: skip it entirely
+            in_tmpl = True
+    return toks
+
+
+
+def parse_x(text, warn, toks=None):
     """Text DirectX .x (what openBVE loads): Mesh, MeshMaterialList, Material/TextureFilename,
-    MeshTextureCoords and Frame/FrameTransformMatrix. Binary/compressed .x is not supported."""
-    head = text[:16]
-    if not head.startswith("xof"):
-        warn("not a DirectX .x file")
-        return []
-    if head[8:11] != "txt":
-        warn("binary/compressed .x files are not supported (re-save as text .x)")
-        return []
-    toks = _x_tokens(text[16:])
+    MeshTextureCoords and Frame/FrameTransformMatrix. Also accepts a pre-built token list (binary .x)."""
+    if toks is None:
+        head = text[:16]
+        if not head.startswith("xof"):
+            warn("not a DirectX .x file")
+            return []
+        if head[8:11] != "txt":
+            warn("compressed text .x files are not supported (re-save as text .x)")
+            return []
+        toks = _x_tokens(text[16:])
     i, root = 0, []
     while i < len(toks):
         t = toks[i]
@@ -523,10 +604,22 @@ def parse_x(text, warn):
 
 def load_builders(path, warn):
     """Parse an object file by extension (.b3d/.csv -> BVE script, .x -> DirectX text)."""
-    text = read_text(path)
     if Path(path).suffix.lower() == ".x":
-        return parse_x(text, warn)
-    return parse_bve(text, warn)
+        data = Path(path).read_bytes()
+        if data[:4] == b"xof " and data[8:12] in (b"bin ", b"bzip", b"tzip"):
+            try:
+                fmt, fsz = data[8:12], (64 if data[12:16] == b"0064" else 32)
+                if fmt == b"bin ":
+                    return parse_x(None, warn, _x_binary_tokens(data[16:], fsz))
+                raw = _x_mszip(data)
+                if fmt == b"tzip":
+                    return parse_x(None, warn, _x_tokens(raw.decode("latin-1")))
+                return parse_x(None, warn, _x_binary_tokens(raw, fsz))
+            except Exception as e:
+                warn("could not read binary/compressed .x (%s)" % e)
+                return []
+        return parse_x(read_text(path), warn)
+    return parse_bve(read_text(path), warn)
 
 
 # --------------------------------------------------------------- textures
@@ -828,6 +921,7 @@ class Glb:
 
     def build_mesh(self, name, builders, base_dir, flip, warn):
         groups = {}
+        tri_list = []
         bad = 0
         cut = 0
         for b in builders:
@@ -875,18 +969,47 @@ class Glb:
                     if ln < 1e-12:
                         continue
                     nrm = (nx / ln, ny / ln, nz / ln)
-                    pos, nor, uvs, ind, seen = g
-                    for pt, i in zip(pts, tri):
-                        uv = b.uv.get(i, (0.0, 0.0))
-                        vk = (pt, nrm, uv)
-                        vi = seen.get(vk)
-                        if vi is None:
-                            vi = len(pos) // 3
-                            seen[vk] = vi
-                            pos.extend(pt)
-                            nor.extend(nrm)
-                            uvs.extend(uv)
-                        ind.append(vi)
+                    tri_list.append((key, pts, [b.uv.get(i, (0.0, 0.0)) for i in tri], nrm, ln))
+        # Smooth normals: every corner averages the face normals of all triangles that touch the
+        # same position and bend away by less than SMOOTH_ANGLE (area weighted). Corners that end
+        # up identical are shared, so the mesh is connected in Blender (Shade Smooth by Angle works).
+        def rk(pt):
+            return (round(pt[0], 5), round(pt[1], 5), round(pt[2], 5))
+        smooth = SMOOTH_ANGLE > 0
+        cos_t = math.cos(math.radians(SMOOTH_ANGLE))
+        adj = {}
+        if smooth:
+            for ti, t in enumerate(tri_list):
+                for pt in t[1]:
+                    adj.setdefault(rk(pt), []).append(ti)
+        ncache = {}
+        for gkey, pts, uvl, nrm, _w in tri_list:
+            pos, nor, uvs, ind, seen = groups[gkey]
+            for pt, uv in zip(pts, uvl):
+                n = nrm
+                if smooth:
+                    ck = (rk(pt), nrm)
+                    n = ncache.get(ck)
+                    if n is None:
+                        sx = sy = sz = 0.0
+                        for tj in adj[rk(pt)]:
+                            n2, w2 = tri_list[tj][3], tri_list[tj][4]
+                            if n2[0] * nrm[0] + n2[1] * nrm[1] + n2[2] * nrm[2] >= cos_t:
+                                sx += n2[0] * w2
+                                sy += n2[1] * w2
+                                sz += n2[2] * w2
+                        L = math.sqrt(sx * sx + sy * sy + sz * sz)
+                        n = (round(sx / L, 5), round(sy / L, 5), round(sz / L, 5)) if L > 1e-12 else nrm
+                        ncache[ck] = n
+                vk = (pt, n, uv)
+                vi = seen.get(vk)
+                if vi is None:
+                    vi = len(pos) // 3
+                    seen[vk] = vi
+                    pos.extend(pt)
+                    nor.extend(n)
+                    uvs.extend(uv)
+                ind.append(vi)
         if bad:
             warn("%d face(s) referenced missing vertices" % bad)
         if cut:
@@ -1371,9 +1494,13 @@ def main():
     ap.add_argument("--split-cutouts", action="store_true",
                     help="write partly transparent parts (grilles, straps, glass) to a separate "
                          "<name>_cutouts.glb, so they can be handled separately (e.g. in Roblox)")
+    ap.add_argument("--smooth-angle", type=float, default=45.0, metavar="DEG",
+                    help="smooth shading: faces meeting at less than this angle share normals "
+                         "(default 45; 0 = flat shading like before)")
     ap.add_argument("--single-sided", action="store_true", help=argparse.SUPPRESS)  # old option, now the default
     a = ap.parse_args()
-    global FORCE_DOUBLE_SIDED, KEY_TOLERANCE, CUT_CLEAR_FACES, SPLIT_CUTOUTS
+    global FORCE_DOUBLE_SIDED, KEY_TOLERANCE, CUT_CLEAR_FACES, SPLIT_CUTOUTS, SMOOTH_ANGLE
+    SMOOTH_ANGLE = max(0.0, a.smooth_angle)
     SPLIT_CUTOUTS = a.split_cutouts
     KEY_TOLERANCE = a.key_tolerance
     CUT_CLEAR_FACES = not a.keep_cutouts
